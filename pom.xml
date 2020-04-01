@@ -191,16 +191,16 @@
                         </executions>
                     </plugin>
 
-                    <plugin>
-                        <groupId>org.sonatype.plugins</groupId>
-                        <artifactId>nexus-staging-maven-plugin</artifactId>
-                        <extensions>true</extensions>
-                        <configuration>
-                            <serverId>oss</serverId>
-                            <nexusUrl>https://oss.sonatype.org/</nexusUrl>
-                            <autoReleaseAfterClose>true</autoReleaseAfterClose>
-                        </configuration>
-                    </plugin>
+<!--                    <plugin>-->
+<!--                        <groupId>org.sonatype.plugins</groupId>-->
+<!--                        <artifactId>nexus-staging-maven-plugin</artifactId>-->
+<!--                        <extensions>true</extensions>-->
+<!--                        <configuration>-->
+<!--                            <serverId>oss</serverId>-->
+<!--                            <nexusUrl>https://oss.sonatype.org/</nexusUrl>-->
+<!--                            <autoReleaseAfterClose>true</autoReleaseAfterClose>-->
+<!--                        </configuration>-->
+<!--                    </plugin>-->
 
                 </plugins>
             </build>
