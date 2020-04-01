@@ -1,0 +1,88 @@
+package com.tencent.cloud.asr.tts.sdk.utils;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import org.apache.commons.lang.ArrayUtils;
+import org.apache.commons.lang.StringUtils;
+
+import com.tencent.cloud.asr.tts.sdk.config.TtsConfig;
+
+public class LineSplitUtils {
+
+	/**
+	 * 比较智能地将一行较长的文字分隔成多个独立的句子，用于发送给远程服务器做识别。 用户可以覆盖此方法，从而实现自己的分割逻辑。
+	 * 
+	 * <pre>
+	 * 目前已默认的做法是：
+	 * 1. 优先判断：句号，问号和叹号，发现时就做断句处理。使用的符号可在TtsConfig.SEPARATOR_CHARS配置
+	 * 2. 若分割后的句子依然超过限定长度，则再采用逗号分割一轮，同时分割后也会做短小片段的拼接，确保只会分割成大的语句块。
+	 * </pre>
+	 */
+	public static List<String> smartSplit(String line) {
+		List<String> list = new ArrayList<String>();
+		if (line.length() <= TtsConfig.SEPARATOR_LENGTH_LIMIT) {
+			list.add(line);
+			return list;
+		}
+		// 关键字分割：
+		splitAndAdd(list, line, 0);
+		// 用逗号做进一步的细粒度分割：
+		List<String> resultList = new ArrayList<String>();
+		for (String item : list) {
+			if (item.length() <= TtsConfig.SEPARATOR_LENGTH_LIMIT) {
+				resultList.add(item);
+			} else {
+				slipByComma(resultList, item);
+			}
+		}
+		return resultList;
+	}
+
+	private static void splitAndAdd(List<String> list, String line, int charPosi) {
+		String mark = TtsConfig.SEPARATOR_CHARS[charPosi];
+		String[] items = StringUtils.split(line, mark);
+		for (String item : items) {
+			if (items.length > 1 && notEndWithSeparator(item))
+				item = item + mark; // 把符号补回来
+			if (charPosi == TtsConfig.SEPARATOR_CHARS.length - 1) {
+				list.add(item); // 递归结束。
+			} else if (item.length() <= TtsConfig.SEPARATOR_LENGTH_LIMIT) {
+				list.add(item);
+			} else {
+				splitAndAdd(list, item, charPosi + 1);
+			}
+		}
+	}
+
+	/**
+	 * 使用逗号做分割符，并且拼接短小的片段，将结果分割成几个大块。
+	 */
+	private static void slipByComma(List<String> resultList, String item) {
+		String[] subItems = StringUtils.split(item, "，,");
+		if (subItems.length == 1) {
+			resultList.add(item);
+			return;
+		}
+		String subRes = subItems[0] + "，";
+		for (int i = 1; i < subItems.length; i++) {
+			String sub = subItems[i];
+			if (sub.length() == 0)
+				continue;
+			if (notEndWithSeparator(sub))
+				sub = sub + "，"; // 把逗号补回来
+			if (subRes.length() + sub.length() > TtsConfig.SEPARATOR_LENGTH_LIMIT) {
+				resultList.add(subRes);
+				subRes = sub;
+			} else {
+				subRes += sub;
+			}
+		}
+		if (subRes.length() > 0)
+			resultList.add(subRes);
+	}
+
+	private static boolean notEndWithSeparator(String str) {
+		return !ArrayUtils.contains(TtsConfig.SEPARATOR_CHARS, str.substring(str.length() - 1));
+	}
+}

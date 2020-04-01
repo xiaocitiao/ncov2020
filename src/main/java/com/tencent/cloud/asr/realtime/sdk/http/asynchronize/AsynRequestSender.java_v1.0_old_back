@@ -1,0 +1,226 @@
+/*
+ * Copyright (c) 2017-2018 THL A29 Limited, a Tencent company. All Rights Reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.tencent.cloud.asr.realtime.sdk.http.asynchronize;
+
+import static com.tencent.cloud.asr.realtime.sdk.config.AsrGlobelConfig.CUT_LENGTH;
+import static com.tencent.cloud.asr.realtime.sdk.config.AsrInternalConfig.REAL_ASR_URL;
+import static com.tencent.cloud.asr.realtime.sdk.config.AsrInternalConfig.SIGN_URL;
+
+import java.util.ArrayList;
+import java.util.List;
+import com.tencent.cloud.asr.realtime.sdk.http.base.HttpRequester;
+import com.tencent.cloud.asr.realtime.sdk.model.request.RasrBytesRequest;
+import com.tencent.cloud.asr.realtime.sdk.model.response.VoiceResponse;
+import com.tencent.cloud.asr.realtime.sdk.utils.ByteUtils;
+import com.tencent.cloud.asr.realtime.sdk.utils.SignBuilder;
+
+/**
+ * 异步请求功能中的Http请求发送对象。有做一些特别的处理。1.0版本。目前已暂停使用。
+ * 
+ * <pre>
+ * 目标如下：
+ * 将请求对象中的数据，拼装或者拆分成等于CUT_LENGTH值的数组，按顺序发出请求，将剩余的最后一份数据暂存在lastCachedBytes变量中。
+ * 即使最后一份数据长度等于CUT_LENGTH，也不发出，避免在最后发送 “voiceEnd信号”时，无数据可发。
+ * 
+ * 处理流程：
+ * 1. 先判断当前请求是否携带voiceEnd信号，且请求中没有消息体：是则发出最后的回复，本次结束。
+ * 2. 前一次刚好滞留了一个分片的长度时，先发出一次请求。
+ * 3. 常规处理逻辑：先处理消息体（即list）中前面的N-1个数组，拼装或拆分成多个CUT_LENGTH长度的数组，发出请求。
+ * 4. 特别处理最后一个数组，余下一份数据，保存到lastCachedBytes变量中，供下次使用。
+ * 
+ * 另外，本对象在收到回复后，记录了每个分片的请求耗时；标记了是否为最后一个分片；统计了前面N个分片的平均请求耗时。
+ * </pre>
+ * 
+ * @author iantang
+ * @version 1.0
+ */
+public class AsynRequestSender {
+
+	private HttpRequester httpRequester = new HttpRequester();
+
+	/**
+	 * 最后一份未被发出的数组数据
+	 */
+	private byte[] lastCachedBytes = null;
+
+	/**
+	 * 下一个发出的请求所对应的seq号码
+	 */
+	private int seq = 0;
+
+	/**
+	 * 专门做延迟统计的对象
+	 */
+	private TimeRecoder timeRecoder = new TimeRecoder();
+
+	/**
+	 * 当前最后一次收到的回复。
+	 */
+	private VoiceResponse lastResponse = null;
+
+	/**
+	 * 当前全部回复组成的列表。对于一个请求对象中，可能出现的多个有效的开始、中间、尾包回复，都放到list中，后面通知时再做区分。
+	 */
+	private List<VoiceResponse> responseList = new ArrayList<VoiceResponse>();
+
+	public List<VoiceResponse> send(RasrBytesRequest rasrBytesRequest, RasrBytesRequest nextRequest) {
+		this.responseList.clear(); // 先清空。
+		if (rasrBytesRequest.isEndReceived() && rasrBytesRequest.getBytesList().size() == 0) {
+			if (this.lastCachedBytes != null) {
+				// 只需补发最后一个bytes即可。
+				this.sendEndBytes(rasrBytesRequest, this.lastCachedBytes);
+				return this.responseList;
+			} else {
+				System.out.println("Skip repeat endFlag mssage, or previous error connection.");
+				// ignore 通常是因为用户重复调用了ReceiverEntrance.voiceEnd()方法
+				return this.responseList;
+			}
+		}
+
+		// 正常情况的处理：
+		// 前一次刚好滞留了一个分片的长度时，先发一次请求：
+		byte[] current = this.lastCachedBytes;
+		if (current != null && current.length == CUT_LENGTH)
+			current = this.cutAndSend(rasrBytesRequest, current, true);
+
+		// 常规处理前面n个数组，最后一个除外：
+		int size = rasrBytesRequest.getBytesList().size();
+		for (int i = 0; i < size - 1; i++) {
+		    // 这个for循环体里面的代码，应该也可以改成v1.1里面的写法，会简单一些，时间关系，就不做修改和测试了。
+			byte[] message = rasrBytesRequest.getBytesList().get(i);
+			if (current == null) {
+				current = message;
+				continue;
+			}
+			// 先切成小块发出去
+			if (current.length >= CUT_LENGTH) {
+				byte[] left = this.cutAndSend(rasrBytesRequest, current, true);
+				if (left == null) {
+					current = message;
+					continue;
+				} else {
+					current = left;
+				}
+			}
+			// 拼接
+			current = ByteUtils.concat(current, message);
+			if (current.length >= CUT_LENGTH) {
+				current = this.cutAndSend(rasrBytesRequest, current, true);
+			}
+		}
+		// 特别处理最后一个数组(可不能处理完）：
+		byte[] lastMessage = rasrBytesRequest.getBytesList().get(rasrBytesRequest.getBytesList().size() - 1);
+		current = this.contract(current, lastMessage);
+
+		if (current.length > CUT_LENGTH) {
+			current = this.cutAndSend(rasrBytesRequest, current, false);
+		}
+		if (rasrBytesRequest.isEndReceived()) {
+			this.sendEndBytes(rasrBytesRequest, current);
+		} else {
+			// 肯定要把最后一块数据留下来，用于下次收到结束符号时发出请求。如果不留的话，下次收到单纯的结束标记时就没法发送“end=1的请求”了。
+			this.lastCachedBytes = current;
+		}
+		return this.responseList;
+	}
+
+	/**
+	 * 获取当前最后一次收到的回复内容。
+	 */
+	public VoiceResponse getLastReponse() {
+		return lastResponse;
+	}
+
+	/**
+	 * 将最后一个分片的请求发出去，并获取回复。同时获得本次请求所花时间。
+	 */
+	private void sendEndBytes(RasrBytesRequest rasrBytesRequest, byte[] endBytes) {
+		long writeTime = System.currentTimeMillis();
+		VoiceResponse voiceResponse = this.sendRequest(rasrBytesRequest, 1, endBytes);
+		if (voiceResponse != null)
+			voiceResponse.getTimeStat().setEndCut(true); // 标记为结束分片的回复
+		this.timeRecoder.addEndDelay(voiceResponse, rasrBytesRequest.getMessageTime(), writeTime);
+		this.checkAddResponse(voiceResponse);
+
+		this.lastCachedBytes = null;
+		this.seq = 0;
+	}
+
+	private byte[] contract(byte[] current, byte[] lastMessage) {
+		if (current == null) {
+			return lastMessage;
+		} else {
+			return ByteUtils.concat(current, lastMessage);
+		}
+	}
+
+	/**
+	 * 切分数组并发送请求。所有发出去的数组，都不是最后一个分片。
+	 * 
+	 * @param canSendLast
+	 *            如果最后一块刚好等于CUT_LENGTH时，是否可以发出。如果为false，则即使最后一块的长度刚好等于CUT_LENGTH，也不会切分。
+	 * 
+	 * @return 返回剩下的数组。如果刚好切分完，则返回null
+	 */
+	private byte[] cutAndSend(RasrBytesRequest rasrBytesRequest, byte[] current, boolean canSendLast) {
+		int posi = 0;
+		while (current.length - posi > CUT_LENGTH) {
+			sendMiddleCut(rasrBytesRequest, current, posi);
+			posi = posi + CUT_LENGTH;
+		}
+		if (current.length - posi == CUT_LENGTH && canSendLast) {
+			sendMiddleCut(rasrBytesRequest, current, posi);
+			return null;
+		}
+		// 返回剩下的最后一块
+		return ByteUtils.subBytes(current, posi, current.length - posi);
+	}
+
+	private void sendMiddleCut(RasrBytesRequest rasrBytesRequest, byte[] current, int posi) {
+		long writeTime = System.currentTimeMillis();
+		byte[] cut = ByteUtils.subBytes(current, posi, CUT_LENGTH);
+		VoiceResponse voiceResponse = this.sendRequest(rasrBytesRequest, 0, cut);
+		this.timeRecoder.addMiddleDelay(voiceResponse, rasrBytesRequest.getMessageTime(), writeTime);
+		this.checkAddResponse(voiceResponse);
+	}
+
+	private void checkAddResponse(VoiceResponse voiceResponse) {
+		if (voiceResponse == null)
+			return;
+		this.lastResponse = voiceResponse;
+		this.responseList.add(voiceResponse); // 这里暂时不做尾包区分，直接添加好了，后面再做区分。
+	}
+
+	private VoiceResponse sendRequest(RasrBytesRequest rasrBytesRequest, int end, byte[] dataPacket) {
+		// 1、serverUrl
+		String serverUrl = rasrBytesRequest.generateUrl(this.seq, end);
+		String signUrl = serverUrl;
+		if (!REAL_ASR_URL.equals(SIGN_URL))
+			signUrl = serverUrl.replaceFirst(REAL_ASR_URL, SIGN_URL);
+
+		// 2、签名
+		String sign = SignBuilder.createPostSign(signUrl, rasrBytesRequest.getSecretKey());
+		// System.out.println("签名: " + sign); // Temp test.
+		/*this.sleepSomeTime(1);*/// 不Sleep了，连接池理论上不会因为连续发包导致粘连。
+		// 请求
+		VoiceResponse voiceResponse = this.httpRequester.send(serverUrl, sign, dataPacket);
+		voiceResponse.getTimeStat().setMessageTime(rasrBytesRequest.getMessageTime()); // 传递messageTime
+		this.seq++;
+
+		return voiceResponse;
+	}
+
+}
