@@ -2,6 +2,17 @@
 
 ## 腾讯云智能语音
 
+官方原始说明参考: [腾讯TTS](https://cloud.tencent.com/document/product/1073/37933)
+
+maven引用
+
+    <dependency>
+      <groupId>com.github.xiaocitiao</groupId>
+      <artifactId>tencent-asr-tts-sdk</artifactId>
+      <version>1.0</version>
+    </dependency>
+
+---
 #### 1> 修改官方传统jar包依赖 -> POM 依赖
 
 #### 2> bugfix 官方http连接池 使用Timer 无线调度; 导致 执行完进程无法自动结束bug
